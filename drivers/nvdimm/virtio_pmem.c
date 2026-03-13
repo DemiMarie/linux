@@ -8,6 +8,7 @@
  */
 #include "virtio_pmem.h"
 #include "nd.h"
+#include <linux/io.h>
 
 static struct virtio_device_id id_table[] = {
 	{ VIRTIO_ID_PMEM, VIRTIO_DEV_ANY_ID },
@@ -84,6 +85,19 @@ static int virtio_pmem_probe(struct virtio_device *vdev)
 				size, &vpmem->size);
 	}
 
+	vpmem->virt_addr = devm_memremap(&vdev->dev, vpmem->start,
+					 vpmem->size, ARCH_MEMREMAP_PMEM);
+	if (IS_ERR(vpmem->virt_addr)) {
+		err = PTR_ERR(vpmem->virt_addr);
+		goto out_vq;
+	}
+
+	vpmem->dax_dev = virtio_pmem_alloc_dax(vpmem);
+	if (IS_ERR(vpmem->dax_dev)) {
+		err = PTR_ERR(vpmem->dax_dev);
+		goto out_vq;
+	}
+
 	res.start = vpmem->start;
 	res.end   = vpmem->start + vpmem->size - 1;
 	vpmem->nd_desc.provider_name = "virtio-pmem";
@@ -94,7 +108,7 @@ static int virtio_pmem_probe(struct virtio_device *vdev)
 	if (!vpmem->nvdimm_bus) {
 		dev_err(&vdev->dev, "failed to register device with nvdimm_bus\n");
 		err = -ENXIO;
-		goto out_vq;
+		goto out_dax;
 	}
 
 	dev_set_drvdata(&vdev->dev, vpmem->nvdimm_bus);
@@ -129,6 +143,11 @@ static int virtio_pmem_probe(struct virtio_device *vdev)
 out_nd:
 	virtio_reset_device(vdev);
 	nvdimm_bus_unregister(vpmem->nvdimm_bus);
+out_dax:
+	if (!IS_ERR_OR_NULL(vpmem->dax_dev)) {
+		kill_dax(vpmem->dax_dev);
+		put_dax(vpmem->dax_dev);
+	}
 out_vq:
 	vdev->config->del_vqs(vdev);
 out_err:
@@ -137,8 +156,11 @@ out_err:
 
 static void virtio_pmem_remove(struct virtio_device *vdev)
 {
+	struct virtio_pmem *vpmem = vdev->priv;
 	struct nvdimm_bus *nvdimm_bus = dev_get_drvdata(&vdev->dev);
 
+	kill_dax(vpmem->dax_dev);
+	put_dax(vpmem->dax_dev);
 	nvdimm_bus_unregister(nvdimm_bus);
 	vdev->config->del_vqs(vdev);
 	virtio_reset_device(vdev);
