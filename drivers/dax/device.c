@@ -312,6 +312,20 @@ static int dax_mmap_prepare(struct vm_area_desc *desc)
 	if (rc)
 		return rc;
 
+	/*
+	 * MAP_SYNC (VM_SYNC) promises synchronous persistence of stores.
+	 * Reject it for DAX devices that require explicit asynchronous flush
+	 * (e.g. virtio-pmem), as CPU stores are not persistent without an
+	 * out-of-band flush operation.
+	 */
+	if (vma_desc_test_flags(desc, VMA_SYNC_BIT) &&
+	    !dax_synchronous(dev_dax->dax_dev)) {
+		dev_dbg(&dev_dax->dev,
+			"%s: MAP_SYNC not supported for async DAX device\n",
+			current->comm);
+		return -EOPNOTSUPP;
+	}
+
 	desc->vm_ops = &dax_vm_ops;
 	vma_desc_set_flags(desc, VMA_HUGEPAGE_BIT);
 	return 0;

@@ -13,6 +13,12 @@ struct dax_region;
 /* dax bus specific ioresource flags */
 #define IORESOURCE_DAX_STATIC BIT(0)
 #define IORESOURCE_DAX_KMEM BIT(1)
+/*
+ * IORESOURCE_DAX_ASYNC: memory requires explicit asynchronous flush (e.g.
+ * virtio-pmem) rather than hardware persistence instructions.  Device-dax
+ * created from such a region must not advertise MAP_SYNC support.
+ */
+#define IORESOURCE_DAX_ASYNC BIT(2)
 
 struct dax_region *alloc_dax_region(struct device *parent, int region_id,
 		struct range *range, int target_node, unsigned int align,

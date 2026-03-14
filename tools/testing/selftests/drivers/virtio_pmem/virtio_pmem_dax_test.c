@@ -2,19 +2,30 @@
 /*
  * virtio_pmem_dax_test.c: self-test for virtio-pmem DAX support
  *
- * Tests that a virtio-pmem-backed DAX device supports direct access:
- *   - Opens /dev/daxX.Y whose provider is "virtio-pmem"
- *   - mmap(MAP_SYNC | MAP_SHARED) to exercise the direct_access callback
- *   - Writes a known pattern and reads it back to verify correctness
- *   - Verifies zero_page_range by mapping at a second offset and checking zeros
+ * Tests performed (all require a virtio-pmem-backed /dev/daxN.M device):
  *
- * The test SKIPs if no virtio-pmem device or DAX device is found.
+ *  1. map_sync_rejected: mmap(MAP_SHARED_VALIDATE|MAP_SYNC) must fail with
+ *     EOPNOTSUPP, because virtio-pmem requires an explicit async virtqueue
+ *     flush for persistence and cannot honour MAP_SYNC semantics.
+ *
+ *  2. dax_read_write: mmap(MAP_SHARED) write + read-back via the DAX mapping.
+ *
+ *  3. zero_page_range: fill a page, then zero it; verify it reads back as 0.
+ *
+ *  4. phys_addr_matches: read the physical base address from the ND region's
+ *     "resource" sysfs attribute, then verify that /proc/self/pagemap reports
+ *     the same physical address for the mmap'd page.
+ *
+ * The test SKIPs gracefully if no virtio-pmem region or DAX device is found.
+ * It must be run as root (pagemap access and DAX device open require root).
  */
 
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,17 +33,18 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
-#include <linux/mman.h>
 
 #include "../../kselftest.h"
 
 #ifndef MAP_SYNC
 #define MAP_SYNC 0x80000
 #endif
+#ifndef MAP_SHARED_VALIDATE
+#define MAP_SHARED_VALIDATE 0x03
+#endif
 
-#define TEST_PREFIX	"drivers/virtio_pmem"
-#define MAP_SIZE	(2 * 4096)  /* two pages */
 #define PATTERN		0xAB
+#define PAGE_SIZE_DEFAULT	4096UL
 
 /* Sysfs root for nvdimm bus regions */
 #define ND_BUS_PATH	"/sys/bus/nd/devices"
@@ -41,13 +53,16 @@
 /* Virtio-pmem provider name as set in virtio_pmem_probe() */
 #define VIRTIO_PMEM_PROVIDER	"virtio-pmem"
 
+static long page_size;
+
 /*
- * Read a sysfs attribute into @buf (up to @size bytes).
- * Returns the number of bytes read (including NUL), or -1 on error.
+ * Read a sysfs attribute into @buf (up to @size bytes), stripping trailing
+ * newlines.  Returns the number of bytes stored (>= 0) or -1 on error.
  */
 static int sysfs_read(const char *path, char *buf, size_t size)
 {
-	int fd, n;
+	int fd;
+	ssize_t n;
 
 	fd = open(path, O_RDONLY);
 	if (fd < 0)
@@ -56,11 +71,10 @@ static int sysfs_read(const char *path, char *buf, size_t size)
 	close(fd);
 	if (n < 0)
 		return -1;
-	/* strip trailing newline */
 	while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r'))
 		n--;
 	buf[n] = '\0';
-	return n;
+	return (int)n;
 }
 
 /*
@@ -117,10 +131,6 @@ static char *find_dax_dev_for_region(const char *region)
 			continue;
 
 		/*
-		 * Check whether this dax device's region symlink points to
-		 * our region.  The dax device sysfs path has a "region" symlink
-		 * or a "region" subdirectory depending on the kernel version.
-		 * As a simpler heuristic, check the dax device name prefix:
 		 * dax<N>.<M> belongs to region<N>.
 		 */
 		if (sscanf(ent->d_name, "dax%d.", &dax_n) != 1)
@@ -140,16 +150,65 @@ static char *find_dax_dev_for_region(const char *region)
 	return NULL;
 }
 
-/* Test: write a pattern and read it back through a DAX mmap */
-static void test_dax_read_write(const char *devpath)
+/*
+ * Read the physical base address of the ND region from its "resource" sysfs
+ * attribute (admin-readable hex value, e.g. "0x140000000").
+ * Returns the address or 0 on error.
+ */
+static uint64_t read_region_phys_base(const char *region)
+{
+	char path[512], val[64];
+	uint64_t addr;
+
+	snprintf(path, sizeof(path), "%s/%s/resource", ND_BUS_PATH, region);
+	if (sysfs_read(path, val, sizeof(val)) < 0)
+		return 0;
+	if (sscanf(val, "%" SCNx64, &addr) != 1 &&
+	    sscanf(val, "0x%" SCNx64, &addr) != 1)
+		return 0;
+	return addr;
+}
+
+/*
+ * Read the physical frame number for the virtual page containing @vaddr
+ * from /proc/self/pagemap.  The caller must ensure the page is present
+ * (e.g. by touching it) before calling this function.
+ *
+ * Returns the PFN (>0) or 0 on error.
+ */
+static uint64_t vaddr_to_pfn(uintptr_t vaddr)
 {
 	int fd;
-	unsigned char *map;
-	size_t i;
-	int pass = 1;
+	off_t off;
+	uint64_t entry = 0;
+	ssize_t n;
 
-	ksft_print_msg("  testing direct access (mmap MAP_SYNC) on %s\n",
-		       devpath);
+	fd = open("/proc/self/pagemap", O_RDONLY);
+	if (fd < 0)
+		return 0;
+
+	off = (off_t)((vaddr / (uintptr_t)page_size) * sizeof(uint64_t));
+	if (lseek(fd, off, SEEK_SET) != off) {
+		close(fd);
+		return 0;
+	}
+	n = read(fd, &entry, sizeof(entry));
+	close(fd);
+	if (n != (ssize_t)sizeof(entry))
+		return 0;
+
+	/* bit 63: page present; bits 54:0: PFN */
+	if (!(entry & (UINT64_C(1) << 63)))
+		return 0;
+
+	return entry & ((UINT64_C(1) << 55) - 1);
+}
+
+/* Test 1: mmap(MAP_SHARED_VALIDATE|MAP_SYNC) must fail with EOPNOTSUPP */
+static void test_map_sync_rejected(const char *devpath)
+{
+	int fd;
+	void *map;
 
 	fd = open(devpath, O_RDWR);
 	if (fd < 0) {
@@ -158,32 +217,64 @@ static void test_dax_read_write(const char *devpath)
 		return;
 	}
 
-	map = mmap(NULL, MAP_SIZE, PROT_READ | PROT_WRITE,
-		   MAP_SHARED | MAP_SYNC, fd, 0);
+	/*
+	 * MAP_SYNC is only honoured (and its validation enforced) with
+	 * MAP_SHARED_VALIDATE — using plain MAP_SHARED silently strips it.
+	 * For virtio-pmem, which requires asynchronous (virtqueue) flushes
+	 * for persistence, MAP_SYNC must be rejected.
+	 */
+	map = mmap(NULL, (size_t)page_size, PROT_READ | PROT_WRITE,
+		   MAP_SHARED_VALIDATE | MAP_SYNC, fd, 0);
+	close(fd);
+
 	if (map == MAP_FAILED) {
-		/*
-		 * MAP_SYNC may not be supported on all archs/configs;
-		 * fall back to MAP_SHARED without MAP_SYNC.
-		 */
-		map = mmap(NULL, MAP_SIZE, PROT_READ | PROT_WRITE,
-			   MAP_SHARED, fd, 0);
-		if (map == MAP_FAILED) {
-			ksft_test_result_skip("mmap(%s): %s\n", devpath,
-					      strerror(errno));
-			close(fd);
-			return;
-		}
-		ksft_print_msg("  MAP_SYNC not supported, using MAP_SHARED\n");
+		if (errno == EOPNOTSUPP)
+			ksft_test_result_pass(
+				"MAP_SYNC correctly rejected (EOPNOTSUPP) on %s\n",
+				devpath);
+		else
+			ksft_test_result_fail(
+				"MAP_SYNC mmap failed with unexpected error %d (%s) on %s\n",
+				errno, strerror(errno), devpath);
+	} else {
+		munmap(map, (size_t)page_size);
+		ksft_test_result_fail(
+			"MAP_SYNC mmap unexpectedly succeeded on %s\n",
+			devpath);
+	}
+}
+
+/* Test 2: write a pattern through a DAX mmap and read it back */
+static void test_dax_read_write(const char *devpath)
+{
+	int fd;
+	unsigned char *map;
+	size_t i;
+	int pass = 1;
+	size_t map_size = (size_t)page_size;
+
+	fd = open(devpath, O_RDWR);
+	if (fd < 0) {
+		ksft_test_result_skip("open(%s): %s\n", devpath,
+				      strerror(errno));
+		return;
 	}
 
-	/* Write pattern to first page */
-	memset(map, PATTERN, 4096);
+	map = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (map == MAP_FAILED) {
+		ksft_test_result_skip("mmap(%s): %s\n", devpath,
+				      strerror(errno));
+		close(fd);
+		return;
+	}
 
-	/* Read back and verify */
-	for (i = 0; i < 4096; i++) {
+	memset(map, PATTERN, map_size);
+
+	for (i = 0; i < map_size; i++) {
 		if (map[i] != PATTERN) {
-			ksft_print_msg("  mismatch at byte %zu: got 0x%02x, expected 0x%02x\n",
-				       i, map[i], PATTERN);
+			ksft_print_msg(
+				"  mismatch at byte %zu: got 0x%02x, expected 0x%02x\n",
+				i, map[i], PATTERN);
 			pass = 0;
 			break;
 		}
@@ -194,19 +285,18 @@ static void test_dax_read_write(const char *devpath)
 	else
 		ksft_test_result_fail("dax read/write on %s\n", devpath);
 
-	munmap(map, MAP_SIZE);
+	munmap(map, map_size);
 	close(fd);
 }
 
-/* Test: zero second page via memset (exercises zero_page_range path) */
+/* Test 3: zero a page via memset and verify it reads back as zero */
 static void test_dax_zero_page(const char *devpath)
 {
 	int fd;
 	unsigned char *map;
 	size_t i;
 	int pass = 1;
-
-	ksft_print_msg("  testing zero_page_range on %s\n", devpath);
+	size_t map_size = 2 * (size_t)page_size;
 
 	fd = open(devpath, O_RDWR);
 	if (fd < 0) {
@@ -215,28 +305,23 @@ static void test_dax_zero_page(const char *devpath)
 		return;
 	}
 
-	map = mmap(NULL, MAP_SIZE, PROT_READ | PROT_WRITE,
-		   MAP_SHARED | MAP_SYNC, fd, 0);
+	map = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 	if (map == MAP_FAILED) {
-		map = mmap(NULL, MAP_SIZE, PROT_READ | PROT_WRITE,
-			   MAP_SHARED, fd, 0);
-		if (map == MAP_FAILED) {
-			ksft_test_result_skip("mmap(%s): %s\n", devpath,
-					      strerror(errno));
-			close(fd);
-			return;
-		}
+		ksft_test_result_skip("mmap(%s): %s\n", devpath,
+				      strerror(errno));
+		close(fd);
+		return;
 	}
 
 	/* Fill second page with non-zero data, then zero it */
-	memset(map + 4096, 0xFF, 4096);
-	memset(map + 4096, 0x00, 4096);
+	memset(map + page_size, 0xFF, (size_t)page_size);
+	memset(map + page_size, 0x00, (size_t)page_size);
 
-	/* Verify the second page is zeroed */
-	for (i = 4096; i < MAP_SIZE; i++) {
+	for (i = (size_t)page_size; i < map_size; i++) {
 		if (map[i] != 0) {
-			ksft_print_msg("  non-zero byte at offset %zu after zero: 0x%02x\n",
-				       i, map[i]);
+			ksft_print_msg(
+				"  non-zero at offset %zu after zero: 0x%02x\n",
+				i, map[i]);
 			pass = 0;
 			break;
 		}
@@ -247,7 +332,79 @@ static void test_dax_zero_page(const char *devpath)
 	else
 		ksft_test_result_fail("zero_page_range on %s\n", devpath);
 
-	munmap(map, MAP_SIZE);
+	munmap(map, map_size);
+	close(fd);
+}
+
+/*
+ * Test 4: verify that the physical address visible in /proc/self/pagemap
+ * matches the physical base address reported in the ND region's "resource"
+ * sysfs attribute.
+ */
+static void test_phys_addr_matches(const char *devpath, const char *region)
+{
+	int fd;
+	unsigned char *map;
+	uint64_t phys_base, pfn, phys_from_pagemap;
+
+	phys_base = read_region_phys_base(region);
+	if (!phys_base) {
+		ksft_test_result_skip(
+			"could not read %s/%s/resource\n", ND_BUS_PATH, region);
+		return;
+	}
+
+	fd = open(devpath, O_RDWR);
+	if (fd < 0) {
+		ksft_test_result_skip("open(%s): %s\n", devpath,
+				      strerror(errno));
+		return;
+	}
+
+	map = mmap(NULL, (size_t)page_size, PROT_READ | PROT_WRITE,
+		   MAP_SHARED, fd, 0);
+	if (map == MAP_FAILED) {
+		ksft_test_result_skip("mmap(%s): %s\n", devpath,
+				      strerror(errno));
+		close(fd);
+		return;
+	}
+
+	/* Touch the page to ensure it is present in the page table */
+	map[0] = 0;
+
+	pfn = vaddr_to_pfn((uintptr_t)map);
+	if (!pfn) {
+		ksft_test_result_skip(
+			"pagemap read failed for %s (running as root?)\n",
+			devpath);
+		munmap(map, (size_t)page_size);
+		close(fd);
+		return;
+	}
+
+	phys_from_pagemap = pfn * (uint64_t)page_size;
+
+	ksft_print_msg(
+		"  region phys_base=0x%016" PRIx64
+		" pagemap phys=0x%016" PRIx64 "\n",
+		phys_base, phys_from_pagemap);
+
+	/*
+	 * The first page of the DAX mapping must start at the physical
+	 * base address of the region.
+	 */
+	if (phys_from_pagemap == phys_base)
+		ksft_test_result_pass(
+			"physical address from pagemap matches region resource on %s\n",
+			devpath);
+	else
+		ksft_test_result_fail(
+			"physical address mismatch on %s: pagemap=0x%016" PRIx64
+			" region=0x%016" PRIx64 "\n",
+			devpath, phys_from_pagemap, phys_base);
+
+	munmap(map, (size_t)page_size);
 	close(fd);
 }
 
@@ -257,11 +414,17 @@ int main(void)
 
 	ksft_print_header();
 
+	page_size = sysconf(_SC_PAGESIZE);
+	if (page_size <= 0)
+		page_size = PAGE_SIZE_DEFAULT;
+
 	/* Find a virtio-pmem backed NVDIMM region */
 	region = find_virtio_pmem_region();
 	if (!region) {
 		ksft_set_plan(1);
-		ksft_test_result_skip("no virtio-pmem region found (is the driver loaded and a device present?)\n");
+		ksft_test_result_skip(
+			"no virtio-pmem region found "
+			"(is the driver loaded and a device present?)\n");
 		ksft_finished();
 	}
 
@@ -271,17 +434,21 @@ int main(void)
 	devpath = find_dax_dev_for_region(region);
 	if (!devpath) {
 		ksft_set_plan(1);
-		ksft_test_result_skip("no DAX device found for region %s (try: ndctl create-namespace -m dax -r %s)\n",
-				      region, region);
+		ksft_test_result_skip(
+			"no DAX device found for region %s "
+			"(try: ndctl create-namespace -m dax -r %s)\n",
+			region, region);
 		free(region);
 		ksft_finished();
 	}
 
 	ksft_print_msg("found DAX device: %s\n", devpath);
 
-	ksft_set_plan(2);
+	ksft_set_plan(4);
+	test_map_sync_rejected(devpath);
 	test_dax_read_write(devpath);
 	test_dax_zero_page(devpath);
+	test_phys_addr_matches(devpath, region);
 
 	free(devpath);
 	free(region);

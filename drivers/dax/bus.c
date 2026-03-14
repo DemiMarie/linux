@@ -1481,7 +1481,14 @@ static struct dev_dax *__devm_create_dev_dax(struct dev_dax_data *data)
 		rc = PTR_ERR(dax_dev);
 		goto err_alloc_dax;
 	}
-	set_dax_synchronous(dax_dev);
+	/*
+	 * Only mark the device synchronous if the backing region does not
+	 * require asynchronous (virtqueue-based) flushes.  Async regions such
+	 * as virtio-pmem do not support MAP_SYNC semantics because writes are
+	 * not persistent until an explicit flush is issued via the virtqueue.
+	 */
+	if (!(dax_region->res.flags & IORESOURCE_DAX_ASYNC))
+		set_dax_synchronous(dax_dev);
 	set_dax_nocache(dax_dev);
 	set_dax_nomc(dax_dev);
 
