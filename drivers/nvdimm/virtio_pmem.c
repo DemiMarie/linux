@@ -29,6 +29,34 @@ static int init_vq(struct virtio_pmem *vpmem)
 	return 0;
 };
 
+static long virtio_pmem_dax_direct_access(struct dax_device *dax_dev,
+		pgoff_t pgoff, long nr_pages, enum dax_access_mode mode,
+		void **kaddr, unsigned long *pfn)
+{
+	struct virtio_pmem *vpmem = dax_get_private(dax_dev);
+	resource_size_t offset = PFN_PHYS(pgoff);
+
+	if (kaddr)
+		*kaddr = vpmem->virt_addr + offset;
+	if (pfn)
+		*pfn = PHYS_PFN(vpmem->start + offset);
+	return nr_pages;
+}
+
+static int virtio_pmem_dax_zero_page_range(struct dax_device *dax_dev,
+		pgoff_t pgoff, size_t nr_pages)
+{
+	struct virtio_pmem *vpmem = dax_get_private(dax_dev);
+
+	memset(vpmem->virt_addr + PFN_PHYS(pgoff), 0, PFN_PHYS(nr_pages));
+	return 0;
+}
+
+static const struct dax_operations virtio_pmem_dax_ops = {
+	.direct_access   = virtio_pmem_dax_direct_access,
+	.zero_page_range = virtio_pmem_dax_zero_page_range,
+};
+
 static int virtio_pmem_validate(struct virtio_device *vdev)
 {
 	struct virtio_shm_region shm_reg;
@@ -84,6 +112,19 @@ static int virtio_pmem_probe(struct virtio_device *vdev)
 				size, &vpmem->size);
 	}
 
+	vpmem->virt_addr = devm_memremap(&vdev->dev, vpmem->start,
+					 vpmem->size, ARCH_MEMREMAP_PMEM);
+	if (IS_ERR(vpmem->virt_addr)) {
+		err = PTR_ERR(vpmem->virt_addr);
+		goto out_vq;
+	}
+
+	vpmem->dax_dev = alloc_dax(vpmem, &virtio_pmem_dax_ops);
+	if (IS_ERR(vpmem->dax_dev)) {
+		err = PTR_ERR(vpmem->dax_dev);
+		goto out_vq;
+	}
+
 	res.start = vpmem->start;
 	res.end   = vpmem->start + vpmem->size - 1;
 	vpmem->nd_desc.provider_name = "virtio-pmem";
@@ -94,7 +135,7 @@ static int virtio_pmem_probe(struct virtio_device *vdev)
 	if (!vpmem->nvdimm_bus) {
 		dev_err(&vdev->dev, "failed to register device with nvdimm_bus\n");
 		err = -ENXIO;
-		goto out_vq;
+		goto out_dax;
 	}
 
 	dev_set_drvdata(&vdev->dev, vpmem->nvdimm_bus);
@@ -129,6 +170,11 @@ static int virtio_pmem_probe(struct virtio_device *vdev)
 out_nd:
 	virtio_reset_device(vdev);
 	nvdimm_bus_unregister(vpmem->nvdimm_bus);
+out_dax:
+	if (!IS_ERR_OR_NULL(vpmem->dax_dev)) {
+		kill_dax(vpmem->dax_dev);
+		put_dax(vpmem->dax_dev);
+	}
 out_vq:
 	vdev->config->del_vqs(vdev);
 out_err:
@@ -137,8 +183,11 @@ out_err:
 
 static void virtio_pmem_remove(struct virtio_device *vdev)
 {
+	struct virtio_pmem *vpmem = vdev->priv;
 	struct nvdimm_bus *nvdimm_bus = dev_get_drvdata(&vdev->dev);
 
+	kill_dax(vpmem->dax_dev);
+	put_dax(vpmem->dax_dev);
 	nvdimm_bus_unregister(nvdimm_bus);
 	vdev->config->del_vqs(vdev);
 	virtio_reset_device(vdev);

@@ -15,6 +15,7 @@
 #include <linux/libnvdimm.h>
 #include <linux/mutex.h>
 #include <linux/spinlock.h>
+#include <linux/dax.h>
 
 struct virtio_pmem_request {
 	struct virtio_pmem_req req;
@@ -52,6 +53,12 @@ struct virtio_pmem {
 	/* Memory region information */
 	__u64 start;
 	__u64 size;
+
+	/* Virtual mapping of the persistent memory region */
+	void *virt_addr;
+
+	/* DAX device for direct access support */
+	struct dax_device *dax_dev;
 };
 
 void virtio_pmem_host_ack(struct virtqueue *vq);

@@ -25,6 +25,7 @@ TARGETS += drivers/net/bonding
 TARGETS += drivers/net/netconsole
 TARGETS += drivers/net/team
 TARGETS += drivers/net/virtio_net
+TARGETS += drivers/virtio_pmem
 TARGETS += drivers/platform/x86/intel/ifs
 TARGETS += dt
 TARGETS += efivarfs

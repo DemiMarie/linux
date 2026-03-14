@@ -51,9 +51,16 @@ static struct dev_dax *__dax_pmem_probe(struct device *dev)
 	/* adjust the dax_region range to the start of data */
 	range = pgmap.range;
 	range.start += offset;
+	/*
+	 * Propagate ND_REGION_ASYNC so that device-dax created from an
+	 * asynchronous-flush region (e.g. virtio-pmem) does not advertise
+	 * MAP_SYNC support.
+	 */
 	dax_region = alloc_dax_region(dev, region_id, &range,
 			nd_region->target_node, le32_to_cpu(pfn_sb->align),
-			IORESOURCE_DAX_STATIC);
+			IORESOURCE_DAX_STATIC |
+			(test_bit(ND_REGION_ASYNC, &nd_region->flags) ?
+			 IORESOURCE_DAX_ASYNC : 0));
 	if (!dax_region)
 		return ERR_PTR(-ENOMEM);
 

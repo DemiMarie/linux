@@ -1,0 +1,6 @@
+# Kernel config options required to run the virtio-pmem DAX selftest.
+CONFIG_VIRTIO_PMEM=m
+CONFIG_LIBNVDIMM=y
+CONFIG_NVDIMM_DAX=y
+CONFIG_DAX=y
+CONFIG_DEV_DAX=m
