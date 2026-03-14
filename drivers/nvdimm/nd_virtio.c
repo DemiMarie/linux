@@ -8,7 +8,6 @@
  */
 #include "virtio_pmem.h"
 #include "nd.h"
-#include <linux/pfn_t.h>
 
  /* The interrupt handler */
 void virtio_pmem_host_ack(struct virtqueue *vq)
@@ -134,40 +133,6 @@ int async_pmem_flush(struct nd_region *nd_region, struct bio *bio)
 	return 0;
 };
 
-static long virtio_pmem_dax_direct_access(struct dax_device *dax_dev,
-		pgoff_t pgoff, long nr_pages, enum dax_access_mode mode,
-		void **kaddr, pfn_t *pfn)
-{
-	struct virtio_pmem *vpmem = dax_get_private(dax_dev);
-	resource_size_t offset = PFN_PHYS(pgoff);
-
-	if (kaddr)
-		*kaddr = vpmem->virt_addr + offset;
-	if (pfn)
-		*pfn = phys_to_pfn_t(vpmem->start + offset, PFN_DEV);
-	return nr_pages;
-}
-
-static int virtio_pmem_dax_zero_page_range(struct dax_device *dax_dev,
-		pgoff_t pgoff, size_t nr_pages)
-{
-	struct virtio_pmem *vpmem = dax_get_private(dax_dev);
-
-	memset(vpmem->virt_addr + PFN_PHYS(pgoff), 0, PFN_PHYS(nr_pages));
-	return 0;
-}
-
-static const struct dax_operations virtio_pmem_dax_ops = {
-	.direct_access = virtio_pmem_dax_direct_access,
-	.zero_page_range = virtio_pmem_dax_zero_page_range,
-};
-
-struct dax_device *virtio_pmem_alloc_dax(struct virtio_pmem *vpmem)
-{
-	return alloc_dax(vpmem, &virtio_pmem_dax_ops);
-}
-
-EXPORT_SYMBOL_GPL(virtio_pmem_alloc_dax);
 EXPORT_SYMBOL_GPL(async_pmem_flush);
 MODULE_DESCRIPTION("Virtio Persistent Memory Driver");
 MODULE_LICENSE("GPL");

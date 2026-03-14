@@ -8,7 +8,6 @@
  */
 #include "virtio_pmem.h"
 #include "nd.h"
-#include <linux/io.h>
 
 static struct virtio_device_id id_table[] = {
 	{ VIRTIO_ID_PMEM, VIRTIO_DEV_ANY_ID },
@@ -28,6 +27,34 @@ static int init_vq(struct virtio_pmem *vpmem)
 	INIT_LIST_HEAD(&vpmem->req_list);
 
 	return 0;
+};
+
+static long virtio_pmem_dax_direct_access(struct dax_device *dax_dev,
+		pgoff_t pgoff, long nr_pages, enum dax_access_mode mode,
+		void **kaddr, unsigned long *pfn)
+{
+	struct virtio_pmem *vpmem = dax_get_private(dax_dev);
+	resource_size_t offset = PFN_PHYS(pgoff);
+
+	if (kaddr)
+		*kaddr = vpmem->virt_addr + offset;
+	if (pfn)
+		*pfn = PHYS_PFN(vpmem->start + offset);
+	return nr_pages;
+}
+
+static int virtio_pmem_dax_zero_page_range(struct dax_device *dax_dev,
+		pgoff_t pgoff, size_t nr_pages)
+{
+	struct virtio_pmem *vpmem = dax_get_private(dax_dev);
+
+	memset(vpmem->virt_addr + PFN_PHYS(pgoff), 0, PFN_PHYS(nr_pages));
+	return 0;
+}
+
+static const struct dax_operations virtio_pmem_dax_ops = {
+	.direct_access   = virtio_pmem_dax_direct_access,
+	.zero_page_range = virtio_pmem_dax_zero_page_range,
 };
 
 static int virtio_pmem_validate(struct virtio_device *vdev)
@@ -92,7 +119,7 @@ static int virtio_pmem_probe(struct virtio_device *vdev)
 		goto out_vq;
 	}
 
-	vpmem->dax_dev = virtio_pmem_alloc_dax(vpmem);
+	vpmem->dax_dev = alloc_dax(vpmem, &virtio_pmem_dax_ops);
 	if (IS_ERR(vpmem->dax_dev)) {
 		err = PTR_ERR(vpmem->dax_dev);
 		goto out_vq;
